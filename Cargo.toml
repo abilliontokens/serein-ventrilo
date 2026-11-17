@@ -12,7 +12,7 @@ crate-type = ["cdylib"]
 [dependencies]
 # Local Serein checkout for the SDK's native row actions, window size and controls;
 # re-pinned to a Serein revision once those land.
-serein-extension-sdk = { path = "../Serein/extensions/sdk" }
+serein-extension-sdk = { git = "https://github.com/abilliontokens/Serein", rev = "0434bc7cc45455f535bd654ee254bdce4c201af7" }
 
 [profile.release]
 opt-level = "s"

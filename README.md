@@ -94,7 +94,7 @@ and leaves storage unchanged; the next change overwrites it with a valid value.
 ## Build and install
 
 The SDK dependency in `Cargo.toml` points at a local Serein checkout
-(`../Serein/extensions/sdk`) until the SDK revision with native row actions,
+(`the pinned Serein revision`) until the SDK revision with native row actions,
 plugin-chosen controls and window size is published; it is then pinned to that
 revision.
 
