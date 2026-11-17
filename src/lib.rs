@@ -4,17 +4,31 @@
 //! the voice roster), restates a declarative [`InterfaceUi`] tree on every result, and
 //! receives row clicks as the declared `interface_click` action with the clicked
 //! row's id in `values["id"]`: a single click picks a server (`server:<id>`) and
-//! does nothing on a channel; a double click on a voice channel (`channel:<id>`)
-//! joins it and opens (or closes) the call window, and on a text channel
-//! (`text:<id>`) opens (or closes) its chat window. One window shows at a time.
+//! does nothing on a channel. Voice channel rows (`channel:<id>`) carry the host's
+//! native join, so the host itself joins on a double click; the plugin only opens
+//! (or closes) the call window. A double click on a text channel (`text:<id>`) opens
+//! (or closes) its chat window. One window shows at a time.
 
 use serein_extension_sdk::serde_json::{self, Value};
 use serein_extension_sdk::{
-	AppAction, AppInvocation, AppSnapshot, HostEffect, InterfaceDockItem, InterfaceIcon,
-	InterfaceNode, InterfaceTint, InterfaceUi, InterfaceWindow, Invocation,
-	MAX_INTERFACE_DOCK_ITEMS, MAX_INTERFACE_NODES, MAX_INTERFACE_TEXT_BYTES, Output,
-	VoiceRosterEntry,
+	AppInvocation, AppSnapshot, ChannelSnapshot, InterfaceControl, InterfaceDockItem,
+	InterfaceIcon, InterfaceNative, InterfaceNode, InterfaceSize, InterfaceTint, InterfaceUi,
+	InterfaceWindow, Invocation, MAX_INTERFACE_DOCK_ITEMS, MAX_INTERFACE_NODES,
+	MAX_INTERFACE_TEXT_BYTES, Output, VoiceRosterEntry,
 };
+
+/// The slim, Ventrilo-like window the layout asks for while it shows.
+const WINDOW_SIZE: InterfaceSize = InterfaceSize {
+	width: 340,
+	height: 640,
+};
+/// The native buttons at the right of the bottom control row, left to right.
+const CONTROLS: [InterfaceControl; 4] = [
+	InterfaceControl::Disconnect,
+	InterfaceControl::Mute,
+	InterfaceControl::Deafen,
+	InterfaceControl::Settings,
+];
 
 /// The declared panel action the host invokes for a row click.
 const INTERFACE_CLICK: &str = "interface_click";
@@ -28,6 +42,8 @@ const CHAT_WINDOW_PREFIX: &str = "chat:";
 /// Channel kinds shown as rows: voice, and the text kinds (server text, announcement).
 const VOICE_KIND: u8 = 2;
 const TEXT_KINDS: [u8; 2] = [0, 5];
+/// Categories head their channels in the tree.
+const CATEGORY_KIND: u8 = 4;
 
 /// Persisted choices. Corrupt or older-format storage falls back to the default:
 /// layout on, first server, no window. Fields this version no longer uses are ignored.
@@ -108,14 +124,11 @@ fn storage_json(state: &Saved) -> String {
 }
 
 /// One flat result object: the original `Output` fields plus the interface
-/// restatement and at most one host proposal, exactly as the wire allows.
-fn result(output: Output, interface_ui: Option<InterfaceUi>, effects: Vec<HostEffect>) -> Value {
+/// restatement, exactly as the wire allows.
+fn result(output: Output, interface_ui: Option<InterfaceUi>) -> Value {
 	let mut value = serde_json::to_value(&output).expect("plain output data encodes");
 	if let Some(interface) = &interface_ui {
 		value["interface_ui"] = serde_json::to_value(interface).expect("plain tree encodes");
-	}
-	if !effects.is_empty() {
-		value["effects"] = serde_json::to_value(&effects).expect("plain proposal encodes");
 	}
 	value
 }
@@ -146,17 +159,72 @@ fn picked_server<'a>(app: &'a AppSnapshot, state: &Saved) -> Option<&'a str> {
 		.or_else(|| guilds.first().map(|guild| guild.id.as_str()))
 }
 
-fn inert(text: &str, icon: InterfaceIcon) -> InterfaceNode {
+fn inert(text: &str, icon: Option<InterfaceIcon>) -> InterfaceNode {
 	InterfaceNode {
 		id: String::new(),
 		indent: 0,
-		icon: Some(icon),
+		icon,
 		text: text.into(),
 		badge: None,
 		emphasis: false,
 		selected: false,
 		tint: None,
+		native: None,
 	}
+}
+
+/// Order inside one sidebar group: text before voice, then position, then id
+/// (snowflakes compare numerically: shorter is smaller).
+fn sibling_key(channel: &ChannelSnapshot) -> (bool, i32, usize, &str) {
+	(
+		channel.kind == VOICE_KIND,
+		channel.position,
+		channel.id.len(),
+		&channel.id,
+	)
+}
+
+/// One server's listed channels in Discord's sidebar order: channels outside any
+/// category first, then each category by (position, id) followed by its children.
+/// Category entries are kept as headings; a category with no listed channel is
+/// dropped, and a channel whose parent the directory does not hold counts as
+/// uncategorized.
+fn sidebar<'a>(channels: &'a [ChannelSnapshot], guild_id: &str) -> Vec<&'a ChannelSnapshot> {
+	let in_guild = channels
+		.iter()
+		.filter(|channel| channel.guild_id.as_deref() == Some(guild_id));
+	let mut categories: Vec<_> = in_guild
+		.clone()
+		.filter(|channel| channel.kind == CATEGORY_KIND)
+		.collect();
+	categories.sort_by_key(|category| (category.position, category.id.len(), &category.id));
+	let mut listed: Vec<_> = in_guild
+		.filter(|channel| channel.kind == VOICE_KIND || TEXT_KINDS.contains(&channel.kind))
+		.collect();
+	listed.sort_by_key(|channel| sibling_key(channel));
+	let category_of = |channel: &'a ChannelSnapshot| -> Option<&'a str> {
+		channel
+			.parent_id
+			.as_deref()
+			.filter(|parent| categories.iter().any(|category| category.id == *parent))
+	};
+	let mut ordered: Vec<_> = listed
+		.iter()
+		.copied()
+		.filter(|channel| category_of(channel).is_none())
+		.collect();
+	for category in &categories {
+		let children = listed
+			.iter()
+			.copied()
+			.filter(|channel| category_of(channel) == Some(category.id.as_str()));
+		let start = ordered.len();
+		ordered.extend(children);
+		if ordered.len() > start {
+			ordered.insert(start, category);
+		}
+	}
+	ordered
 }
 
 /// One inert person row; the status icon renders left of the name.
@@ -178,20 +246,20 @@ fn person(entry: &VoiceRosterEntry, mine: bool) -> InterfaceNode {
 		InterfaceTint::Muted
 	};
 	InterfaceNode {
-		id: String::new(),
 		indent: 2,
-		icon: Some(icon),
-		text: bounded_text(entry.name.as_deref().unwrap_or(&entry.user_id)),
-		badge: mine.then(|| "You".into()),
-		emphasis: false,
-		selected: false,
 		tint: Some(tint),
+		badge: mine.then(|| "You".into()),
+		..inert(
+			&bounded_text(entry.name.as_deref().unwrap_or(&entry.user_id)),
+			Some(icon),
+		)
 	}
 }
 
 /// Build the whole interface: every server as a small icon in the bottom row's dock (plus
-/// the client's add-a-server button), and in the tree the picked server's name, its text
-/// and voice channels, and under each voice channel the people the roster places there.
+/// the client's add-a-server button), and in the tree the picked server's name, its
+/// categories, text and voice channels in sidebar order, and under each voice channel the
+/// people the roster places there.
 fn build_tree(app: &AppSnapshot, state: &Saved) -> InterfaceUi {
 	let guilds = app
 		.guilds
@@ -228,14 +296,14 @@ fn build_tree(app: &AppSnapshot, state: &Saved) -> InterfaceUi {
 		// The picked server's name heads the tree; switching happens in the dock.
 		nodes.push(InterfaceNode {
 			emphasis: true,
-			..inert(&bounded_text(&guild.name), InterfaceIcon::Server)
+			..inert(&bounded_text(&guild.name), Some(InterfaceIcon::Server))
 		});
-		// Text and voice channels interleave in the directory's own order.
-		for channel in channels {
+		for channel in sidebar(channels, &guild.id) {
 			if nodes.len() == MAX_INTERFACE_NODES {
 				break;
 			}
-			if channel.guild_id.as_deref() != Some(guild.id.as_str()) {
+			if channel.kind == CATEGORY_KIND {
+				nodes.push(inert(&bounded_text(&channel.name), None));
 				continue;
 			}
 			if TEXT_KINDS.contains(&channel.kind) {
@@ -246,28 +314,20 @@ fn build_tree(app: &AppSnapshot, state: &Saved) -> InterfaceUi {
 				nodes.push(InterfaceNode {
 					id: format!("{TEXT_PREFIX}{}", channel.id),
 					indent: 1,
-					icon: Some(InterfaceIcon::Hash),
-					text: bounded_text(&channel.name),
-					badge: None,
-					emphasis: false,
 					selected: open,
-					tint: None,
+					..inert(&bounded_text(&channel.name), Some(InterfaceIcon::Hash))
 				});
 				continue;
 			}
-			if channel.kind != VOICE_KIND {
-				continue;
-			}
-			let is_call_channel = call_channel == Some(channel.id.as_str());
+			// Voice: the host joins natively on a double click or Enter.
 			nodes.push(InterfaceNode {
 				id: format!("{CHANNEL_PREFIX}{}", channel.id),
 				indent: 1,
-				icon: Some(InterfaceIcon::Speaker),
-				text: bounded_text(&channel.name),
-				badge: None,
-				emphasis: false,
-				selected: is_call_channel,
-				tint: None,
+				selected: call_channel == Some(channel.id.as_str()),
+				native: snowflake(&channel.id).then(|| InterfaceNative::JoinVoice {
+					channel_id: channel.id.clone(),
+				}),
+				..inert(&bounded_text(&channel.name), Some(InterfaceIcon::Speaker))
 			});
 			let roster = voice.map(|voice| voice.roster.as_slice()).unwrap_or(&[]);
 			for entry in roster.iter().filter(|entry| entry.channel_id == channel.id) {
@@ -283,13 +343,15 @@ fn build_tree(app: &AppSnapshot, state: &Saved) -> InterfaceUi {
 	}
 
 	if nodes.is_empty() {
-		nodes.push(inert("No channels loaded", InterfaceIcon::Server));
+		nodes.push(inert("No channels loaded", Some(InterfaceIcon::Server)));
 	}
 	InterfaceUi {
 		nodes,
 		window: state.window.clone(),
 		dock,
 		add_server: true,
+		controls: CONTROLS.to_vec(),
+		size: Some(WINDOW_SIZE),
 	}
 }
 
@@ -317,7 +379,7 @@ fn handle(input: AppInvocation) -> Value {
 	// through data_events) restate the interface; events may not touch panels,
 	// proposals or storage.
 	if input.app_event.is_some() {
-		return result(Output::default(), restated(&app, &state), Vec::new());
+		return result(Output::default(), restated(&app, &state));
 	}
 
 	// Row clicks arrive as the declared `interface_click` action with the clicked
@@ -326,33 +388,24 @@ fn handle(input: AppInvocation) -> Value {
 		let row = invocation.value("id");
 		if let Some(id) = row.and_then(|row| row.strip_prefix(SERVER_PREFIX)) {
 			state.server = Some(id.into());
-			return persisted(state, &app, Vec::new());
+			return persisted(state, &app);
 		}
+		// Voice rows: the host joins on the double click itself (the row's native
+		// action). The current call's channel toggles the call window; any other
+		// channel shows the call window for the call the host is joining.
 		if let Some(id) = row.and_then(|row| row.strip_prefix(CHANNEL_PREFIX))
 			&& invocation.double_clicked
 		{
-			let voice = app.voice.as_ref();
-			let mut effects = Vec::new();
-			if voice.and_then(|voice| voice.channel_id.as_deref()) == Some(id) {
-				// Already in this call: show the call window, or close it if it
-				// is already showing. The call itself stays connected.
-				state.window = match state.window {
-					Some(InterfaceWindow::Call) => None,
-					_ => Some(InterfaceWindow::Call),
-				};
-			} else {
-				// Propose joining; the user still confirms via Apply.
-				state.window = Some(InterfaceWindow::Call);
-				effects.push(HostEffect::AppAction {
-					action: AppAction::JoinVoice {
-						channel_id: id.into(),
-						ring: false,
-						muted: voice.is_some_and(|voice| voice.muted),
-						deafened: voice.is_some_and(|voice| voice.deafened),
-					},
-				});
-			}
-			return persisted(state, &app, effects);
+			let in_call = app
+				.voice
+				.as_ref()
+				.and_then(|voice| voice.channel_id.as_deref())
+				== Some(id);
+			state.window = match state.window {
+				Some(InterfaceWindow::Call) if in_call => None,
+				_ => Some(InterfaceWindow::Call),
+			};
+			return persisted(state, &app);
 		}
 		// Text rows: a double click opens that channel's chat window, or closes it
 		// when it is already open.
@@ -364,26 +417,26 @@ fn handle(input: AppInvocation) -> Value {
 				channel_id: id.into(),
 			};
 			state.window = (state.window.as_ref() != Some(&chat)).then_some(chat);
-			return persisted(state, &app, Vec::new());
+			return persisted(state, &app);
 		}
 		// Single clicks on channels and unknown row ids are inert: restate without
 		// changing or saving anything.
-		return result(Output::default(), restated(&app, &state), Vec::new());
+		return result(Output::default(), restated(&app, &state));
 	}
 
 	match invocation.action.as_str() {
 		// Activation re-applies the saved choice; the host does not persist the
 		// storage an activation returns, so nothing is written here.
-		"activate" => result(Output::default(), restated(&app, &state), Vec::new()),
+		"activate" => result(Output::default(), restated(&app, &state)),
 		"show" => {
 			let on = !state.off;
 			let text = if on {
 				"Ventrilo Mode is on: Serein's main panes are replaced by the slim tree of \
-				 servers, their text and voice channels, and the people in each voice channel. \
-				 Click a server to switch to it. Double-click a voice channel to join it and \
-				 open its call window, or a text channel to open its chat; double-click it \
-				 again to close the window. A single click on a channel does nothing. The \
-				 button switches back to the normal layout."
+				 servers, their categories, text and voice channels, and the people in each \
+				 voice channel. Click a server to switch to it. Double-click a voice channel \
+				 to join it and open its call window, or a text channel to open its chat; \
+				 double-click it again to close the window. A single click on a channel does \
+				 nothing. The button switches back to the normal layout."
 			} else {
 				"Ventrilo Mode is off: Serein shows its normal layout. The button switches to \
 				 the slim Ventrilo-style channel tree."
@@ -394,7 +447,6 @@ fn handle(input: AppInvocation) -> Value {
 					..Default::default()
 				},
 				restated(&app, &state),
-				Vec::new(),
 			)
 		}
 		"toggle" => {
@@ -412,22 +464,20 @@ fn handle(input: AppInvocation) -> Value {
 					..Default::default()
 				},
 				restated(&app, &state),
-				Vec::new(),
 			)
 		}
-		_ => result(Output::default(), None, Vec::new()),
+		_ => result(Output::default(), None),
 	}
 }
 
 /// Persist the changed choices and restate the interface from them.
-fn persisted(state: Saved, app: &AppSnapshot, effects: Vec<HostEffect>) -> Value {
+fn persisted(state: Saved, app: &AppSnapshot) -> Value {
 	result(
 		Output {
 			storage: Some(storage_json(&state)),
 			..Default::default()
 		},
 		restated(app, &state),
-		effects,
 	)
 }
 
@@ -443,9 +493,17 @@ mod tests {
 	};
 	use std::collections::BTreeMap;
 
-	/// The default tree: Alpha's heading, then its text and voice channels interleaved
-	/// in directory order (the category is skipped). Servers live in the dock.
-	const ALPHA_TREE: [&str; 5] = ["Alpha", "general", "General Voice", "news", "Town Square"];
+	/// The default tree: Alpha's heading, its uncategorized channels, then the Lounge
+	/// category and its channels, in sidebar order (text before voice) although the
+	/// directory lists them scrambled. Servers live in the dock.
+	const ALPHA_TREE: [&str; 6] = [
+		"Alpha",
+		"general",
+		"General Voice",
+		"Lounge",
+		"news",
+		"Town Square",
+	];
 
 	fn guild(id: &str, name: &str) -> GuildSnapshot {
 		GuildSnapshot {
@@ -455,12 +513,21 @@ mod tests {
 		}
 	}
 
-	fn channel(id: &str, guild_id: &str, name: &str, kind: u8) -> ChannelSnapshot {
+	fn channel(
+		id: &str,
+		guild_id: &str,
+		name: &str,
+		kind: u8,
+		parent_id: Option<&str>,
+		position: i32,
+	) -> ChannelSnapshot {
 		ChannelSnapshot {
 			id: id.into(),
 			guild_id: Some(guild_id.into()),
 			name: name.into(),
 			kind,
+			parent_id: parent_id.map(Into::into),
+			position,
 		}
 	}
 
@@ -496,13 +563,13 @@ mod tests {
 			}),
 			channels: Some(ChannelDirectorySnapshot {
 				items: vec![
-					channel("103", "10", "general", 0),
-					channel("101", "10", "General Voice", 2),
-					channel("104", "10", "news", 5),
-					channel("105", "10", "Lounge", 4),
-					channel("102", "10", "Town Square", 2),
-					channel("202", "20", "beta-chat", 0),
-					channel("201", "20", "Beta Voice", 2),
+					channel("102", "10", "Town Square", 2, Some("105"), 1),
+					channel("104", "10", "news", 5, Some("105"), 2),
+					channel("105", "10", "Lounge", 4, None, 0),
+					channel("101", "10", "General Voice", 2, None, 1),
+					channel("103", "10", "general", 0, None, 0),
+					channel("201", "20", "Beta Voice", 2, None, 0),
+					channel("202", "20", "beta-chat", 0, None, 0),
 				],
 				truncated: false,
 			}),
@@ -621,7 +688,7 @@ mod tests {
 				.iter()
 				.map(|node| node.id.clone())
 				.collect::<Vec<_>>(),
-			["", "text:103", "channel:101", "text:104", "channel:102"]
+			["", "text:103", "channel:101", "", "text:104", "channel:102"]
 		);
 		let alpha = &tree.nodes[0];
 		assert!(alpha.emphasis && alpha.indent == 0, "inert server heading");
@@ -641,7 +708,7 @@ mod tests {
 		for (index, icon) in [
 			(1, InterfaceIcon::Hash),
 			(2, InterfaceIcon::Speaker),
-			(3, InterfaceIcon::Hash),
+			(4, InterfaceIcon::Hash),
 		] {
 			assert_eq!(
 				(tree.nodes[index].indent, tree.nodes[index].icon),
@@ -649,6 +716,16 @@ mod tests {
 			);
 			assert!(!tree.nodes[index].selected);
 		}
+		// Voice rows carry the host's native join; text rows carry none.
+		assert_eq!(
+			tree.nodes[2].native,
+			Some(InterfaceNative::JoinVoice {
+				channel_id: "101".into()
+			})
+		);
+		assert_eq!(tree.nodes[1].native, None);
+		assert_eq!(tree.controls, CONTROLS);
+		assert_eq!(tree.size, Some(WINDOW_SIZE));
 		assert!(
 			output["storage"].is_null()
 				&& output["panel"]
@@ -677,6 +754,7 @@ mod tests {
 			"General Voice",
 			"Me",
 			"User 2",
+			"Lounge",
 			"news",
 			"Town Square",
 		];
@@ -748,6 +826,7 @@ mod tests {
 				"General Voice",
 				"Talker",
 				"Hushed",
+				"Lounge",
 				"news",
 				"Town Square",
 				"4"
@@ -766,7 +845,7 @@ mod tests {
 			)
 		);
 		assert_eq!(
-			row(7),
+			row(8),
 			(
 				Some(InterfaceIcon::HeadphonesSlash),
 				Some(InterfaceTint::Danger)
@@ -781,7 +860,7 @@ mod tests {
 		let opened = click("text:104", None, true, snapshot(None));
 		let tree = interface(&opened);
 		assert_eq!(tree.window, chat("104"));
-		assert!(tree.nodes[3].selected && !tree.nodes[1].selected);
+		assert!(tree.nodes[4].selected && !tree.nodes[1].selected);
 		no_proposal(&opened);
 		assert_eq!(saved_from(&opened).window, chat("104"));
 		assert!(output_storage(&opened).contains("\"chat:104\""));
@@ -807,7 +886,7 @@ mod tests {
 	}
 
 	#[test]
-	fn voice_double_click_joins_and_replaces_an_open_chat() {
+	fn voice_double_click_opens_the_call_window_and_leaves_the_join_to_the_host() {
 		let storage = storage_json(&Saved {
 			window: chat("103"),
 			..Default::default()
@@ -817,11 +896,12 @@ mod tests {
 		assert_eq!(tree.window, Some(InterfaceWindow::Call));
 		assert!(!tree.nodes[1].selected);
 		assert_eq!(
-			output["effects"],
-			json!([{"type": "app_action", "action": {
-				"type": "join_voice", "channel_id": "102",
-				"ring": false, "muted": false, "deafened": false}}])
+			tree.nodes[5].native,
+			Some(InterfaceNative::JoinVoice {
+				channel_id: "102".into()
+			})
 		);
+		no_proposal(&output);
 		assert_eq!(saved_from(&output).window, Some(InterfaceWindow::Call));
 		assert!(output_storage(&output).contains("\"call\""));
 
@@ -986,6 +1066,8 @@ mod tests {
 						"99",
 						"Room",
 						if index % 2 == 0 { 0 } else { 2 },
+						None,
+						0,
 					)
 				})
 				.collect(),
@@ -999,5 +1081,46 @@ mod tests {
 		let cleared = run("activate", None, None, false, None, AppSnapshot::default());
 		assert_eq!(texts(&cleared), ["No channels loaded"]);
 		interface(&cleared).validate().unwrap();
+	}
+
+	#[test]
+	fn channels_follow_the_sidebar_order() {
+		let mut app = snapshot(None);
+		app.channels = Some(ChannelDirectorySnapshot {
+			items: vec![
+				channel("340", "10", "Zone", 2, Some("302"), 0),
+				channel("1000", "10", "second", 0, Some("301"), 1),
+				channel("302", "10", "Zeta", 4, None, 1),
+				channel("320", "10", "Raid", 2, Some("300"), 0),
+				channel("350", "10", "forum", 15, Some("309"), 0),
+				channel("309", "10", "Empty", 4, None, 5),
+				channel("310", "10", "Lobby", 2, None, 0),
+				channel("330", "10", "first", 0, Some("301"), 1),
+				channel("311", "10", "rules", 0, None, 9),
+				channel("301", "10", "Eta", 4, None, 1),
+				channel("321", "10", "plans", 5, Some("300"), 4),
+				channel("312", "10", "lost", 0, Some("999"), 3),
+				channel("300", "10", "Early", 4, None, 0),
+			],
+			truncated: false,
+		});
+		let output = run("activate", None, None, false, None, app);
+		// Uncategorized (an unknown parent counts) first, text before voice; then
+		// categories by position and numeric id, each with its children; a category
+		// without a listed channel is left out.
+		assert_eq!(
+			texts(&output),
+			[
+				"Alpha", "lost", "rules", "Lobby", "Early", "plans", "Raid", "Eta", "first",
+				"second", "Zeta", "Zone"
+			]
+		);
+		let tree = interface(&output);
+		for index in [4, 7, 10] {
+			let heading = &tree.nodes[index];
+			assert!(heading.id.is_empty() && heading.indent == 0 && !heading.emphasis);
+			assert_eq!((heading.icon, &heading.native), (None, &None));
+		}
+		tree.validate().unwrap();
 	}
 }

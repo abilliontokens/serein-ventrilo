@@ -6,12 +6,14 @@
 
 A [Serein](https://github.com/ViceVerse-cz/Serein) extension that replaces the
 navigation, conversation and member panes with a slim, Ventrilo-style tree: the
-picked server's text and voice channels and the people in each voice channel.
-Your servers appear as small icons at the left of the bottom control row, next to
-the client's own add-a-server button, and the gear, mute/deafen and disconnect
-controls stay on that row. One native window can show beside the tree: the call
-stage or one text channel's chat. The plugin draws nothing itself. It restates a
-declarative interface on every result, and Serein renders it generically.
+picked server's categories, text and voice channels and the people in each voice
+channel. While the layout shows, it asks for a slim 340 × 640 window. Your servers
+appear as small icons at the left of the bottom control row, next to the client's
+own add-a-server button, and the plugin places the disconnect, mute, deafen and
+settings controls at the right of that row. One native window can show beside the
+tree: the call stage or one text channel's chat. The plugin draws nothing itself.
+It restates a declarative interface on every result, and Serein renders it
+generically.
 
 It doubles as a reference for building on `interface_ui`.
 
@@ -25,8 +27,8 @@ It doubles as a reference for building on `interface_ui`.
 | `channel_directory` | List each server's text and voice channels. |
 | `voice_state` | Read the current call and the voice roster: who sits in which voice channel, with names, mute/deafen (self and server) and speaking flags. |
 | `app_context` | Recognize your own row for the `You` badge. |
-| `voice_connect` | Propose joining a voice channel when you double-click one. |
-| `voice_control` | Keep the call-control lane available; today the host's bottom strip already provides mute, deafen and disconnect. |
+| `voice_connect` | Let the host join a voice channel directly when you double-click its row (the row's native join; no Apply step). |
+| `voice_control` | Keep the call-control lane available; the disconnect, mute and deafen buttons the plugin places on the bottom row are the host's own. |
 | `app_events` | Refresh the tree when voice state changes (`voice` events), so speaking and mute indicators update. |
 | `data_events` | Refresh the tree when servers or channels change (`channels` events). |
 
@@ -39,17 +41,29 @@ It doubles as a reference for building on `interface_ui`.
   joining or leaving a call; the picked server is highlighted, and its name heads
   the tree. The **+** after them is Serein's own add-a-server button. The plugin
   never sees what it does.
-- **Channel rows** follow the order of the client's channel list. Text channels
-  (server text and announcement channels) carry a `#` icon; voice channels a
-  speaker. Categories, threads, forums and stage channels are not listed.
+- **Channel rows** follow Discord's sidebar order: channels outside any category
+  first, then each category by position (ties by ID) followed by its channels.
+  Within each group text channels come before voice channels, then by position,
+  then by ID. Text channels (server text and announcement channels) carry a `#`
+  icon; voice channels a speaker. Threads, forums and stage channels are not
+  listed.
+- **Category rows** show each category's name as a plain, unclickable heading
+  without an icon. A category with no listed channel is left out, and a channel
+  whose category the client has not loaded counts as uncategorized.
 - **Text-channel rows**: a double-click opens that channel's chat beside the tree
   and highlights the row; double-clicking it again closes the chat. A single
-  click does nothing. Opening a text channel never proposes anything.
-- **Voice-channel rows**: a single click does nothing. A double-click proposes
-  joining it (`join_voice`; Serein still shows
-  the proposal and its **Apply** button) and shows the call window beside the
-  tree. Double-clicking the channel you are already in closes the call window
-  (or brings it back) — the call itself stays connected.
+  click does nothing.
+- **Voice-channel rows**: a single click does nothing. A double-click (or Enter
+  on the focused row) joins the channel directly. Serein runs its own join, with
+  your current mute and deafen state and its usual call-switch confirmation,
+  and labels the row with the channel's real name. The plugin shows the call
+  window beside the tree. Double-clicking the channel you are already in closes
+  the call window (or brings it back); the call itself stays connected.
+- **Bottom row controls**: disconnect (only during a call), mute, deafen and
+  settings, left to right.
+- **Window size**: while the layout shows, Serein resizes the window to a slim
+  340 × 640 (centered, clamped to the monitor) and restores the previous size
+  when the layout ends.
 - **One window at a time**: opening a chat replaces the call window and opening
   the call replaces a chat.
 - **People rows** appear under every voice channel of the picked server that the
@@ -79,8 +93,10 @@ and leaves storage unchanged; the next change overwrites it with a valid value.
 
 ## Build and install
 
-The SDK dependency is pinned in `Cargo.toml` to the Serein revision that adds
-`interface_ui`.
+The SDK dependency in `Cargo.toml` points at a local Serein checkout
+(`../Serein/extensions/sdk`) until the SDK revision with native row actions,
+plugin-chosen controls and window size is published; it is then pinned to that
+revision.
 
 ```sh
 rustup target add wasm32-unknown-unknown
