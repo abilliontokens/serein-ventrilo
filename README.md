@@ -93,10 +93,8 @@ and leaves storage unchanged; the next change overwrites it with a valid value.
 
 ## Build and install
 
-The SDK dependency in `Cargo.toml` points at a local Serein checkout
-(`the pinned Serein revision`) until the SDK revision with native row actions,
-plugin-chosen controls and window size is published; it is then pinned to that
-revision.
+The SDK dependency in `Cargo.toml` is pinned to Serein commit `0434bc7c`, the
+preview revision with native row actions, plugin-chosen controls and window size.
 
 ```sh
 rustup target add wasm32-unknown-unknown
