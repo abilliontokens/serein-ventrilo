@@ -1,0 +1,21 @@
+[package]
+name = "ventrilo"
+version = "1.2.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/abilliontokens/serein-ventrilo"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Pinned to the Serein SDK revision that adds the preview `interface_ui` capability.
+serein-extension-sdk = { git = "https://github.com/abilliontokens/Serein", rev = "201006ad634f35bf6ea014a05e9b819cedc60065" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
